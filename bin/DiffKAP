@@ -1,0 +1,760 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use IO::Handle;
+use Getopt::Long;
+use Pod::Usage;
+
+use Config::IniFiles; 
+use Data::Dumper;
+use File::Basename;
+use File::Copy;
+use File::Path qw(make_path remove_tree);
+use Cwd 'abs_path';
+use Log::Log4perl;
+use POSIX qw{strftime};
+
+use lib dirname(abs_path($0));
+use Utilities;
+
+use constant KMER_OUT_DIR_NAME => 'kmerCount';
+use constant DEK_OUT_DIR_NAME => 'DEK';
+use constant DER_OUT_DIR_NAME => 'DER';
+use constant RESULT_OUT_DIR_NAME => 'results';
+
+
+# This modules will be used by other perl scripts, better check ealier than later if they can be used.
+use Bio::Perl;
+use Bio::SeqIO;
+use Statistics::Descriptive;
+use Parallel::ForkManager;
+
+
+use vars qw($logconfFilename $cmd);
+
+BEGIN {
+	STDERR->autoflush(1);
+	STDOUT->autoflush(1);
+}
+
+
+### Programs used
+my $prog_jellyfish='jellyfish';
+my $prog_identKmerSize='identifyKmerSize';
+my $prog_findTotal='findTotalOccurrence.sh';
+my $prog_splitInMer='splitFileInMerGroup.pl';
+my $prog_normMatch='normMatchKmer.pl';
+my $prog_rmDupSplit='removeRepeatSplitFile.pl';
+my $prog_identDER='identifyDER.pl';
+my $prog_blastParser='parseBlast.pl';
+my $prog_splitSubGroup='splitFileIntoSubGroups.pl';
+my $prog_geneBasedDisp='getNumOfDER4Gene.pl';
+my $prog_sumReport='summaryReport.sh';
+
+
+
+### Set up logger
+$logconfFilename = dirname(abs_path($0)).'/log.conf' if (!$logconfFilename);
+Log::Log4perl->init($logconfFilename);
+my $log=Log::Log4perl->get_logger();
+
+
+########## options ##########
+my ( $help, $man, $DEBUG );
+GetOptions(
+		'help|?' => \$help, 
+		'man' => \$man,
+		'debug' =>\$DEBUG,
+		'logConfig=s' => \$logconfFilename,
+	) or pod2usage(2);
+pod2usage(1) if $help;
+pod2usage(-verbose => 2) if $man;
+
+########## arguments ##########
+if (@ARGV != 1) {
+	$log->error("Incorrect number of argument");
+	pod2usage("***** Error: One argument is required *****");
+}
+
+########## program start ##########
+&printTime("################### Start at");
+my $startTime = time;
+
+##### Read in configuration file
+my $cfg=&readConfig( $ARGV[0] );
+
+
+##### Run through the pipeline
+
+## Extract some common variables from the configuration file
+my $dataDirT1=$cfg->val('general','data_dir_t1');
+my $dataDirT2=$cfg->val('general','data_dir_t2');
+my $kmerSize=$cfg->val('general','kmer_size');
+my $t1ID=$cfg->val('general','t1_id');
+my $t2ID=$cfg->val('general','t2_id');
+my $diffkapDir=($cfg->val('pro_dir', 'diffkap')?$cfg->val('pro_dir', 'diffkap').'/':'');
+my $numOfCPU=$cfg->val('general','num_of_processor');
+my $outDir=$cfg->val('general','out_dir').'/'.$t1ID.'-'.$t2ID;
+
+my $regenAllResults=$cfg->val('advanced','regenerate_all_results');
+my $outDirPath=$outDir.'/'.KMER_OUT_DIR_NAME;
+if ($regenAllResults && $regenAllResults > 0){
+	my @outDirNames=(KMER_OUT_DIR_NAME, DEK_OUT_DIR_NAME, DER_OUT_DIR_NAME, RESULT_OUT_DIR_NAME);
+	foreach my $outDirName (@outDirNames) {
+		my $outDirPath=$outDir.'/'.$outDirName;
+		if (-d $outDirPath) {
+			$log->warn("As REGENERATE_ALL_RESULTS is set, delete directory: $outDirPath");
+			remove_tree($outDirPath);
+		}
+	}
+}
+
+
+my $identKmerSizeProg=$diffkapDir . $prog_identKmerSize;
+$log->info("##### Identifying Kmer Size");
+if (uc($kmerSize) eq "AUTO") {
+	my $tmp = `perl $identKmerSizeProg -verboseLevel 1 $ARGV[0]`;
+	($kmerSize) = $tmp =~ m/Suggested kmer size = (\d+)$/; 
+}
+$log->info("Using kmer size: $kmerSize");
+
+
+## Set up the fork manager
+my $maxNumOfChild=$numOfCPU;
+my $pid;
+
+my $fm;
+$fm = new Parallel::ForkManager($maxNumOfChild) if ($maxNumOfChild>0);
+
+if ($fm) {
+	$fm->run_on_start(
+		sub {
+			my ($pid, $ident)=@_;
+			$log->info("*** $pid Start: $ident ***");
+		}
+	);
+	$fm->run_on_finish(
+		sub {
+			my ($pid, $exist_code, $ident) = @_;
+			if ($exist_code) {
+				$log->fatal("*** PROGRAM TERMINATED! error in running $pid: $ident ***");
+				exit(1);
+			}
+			$log->info("*** $pid Finished: $ident ***");
+		}
+	);
+}
+
+
+## Generate kmer count if necessary
+my $kmerOutDir=$outDir.'/'.KMER_OUT_DIR_NAME;
+make_path($kmerOutDir) if (! -d $kmerOutDir);
+
+# kmer count output filenames
+my $kmerCount1=$kmerOutDir.'/'.basename($dataDirT1)."_${kmerSize}mer_count.tsv";
+my $kmerCount1_tmp=$kmerCount1.'.tmp';
+my $kmerCount2=$kmerOutDir.'/'.basename($dataDirT2)."_${kmerSize}mer_count.tsv";
+my $kmerCount2_tmp=$kmerCount2.'.tmp';
+my $jfSize=$cfg->val('advanced', 'jellyfish_hash_size');
+my $jfProg=($cfg->val('pro_dir', 'jellyfish')?$cfg->val('pro_dir', 'jellyfish').'/':'') . $prog_jellyfish;
+
+
+
+# If there is spare CPU, get a child does the first count
+$pid = $fm->start("kmer counting for $kmerCount1") and goto KMERCOUNT2 if ($fm);
+unless (-e $kmerCount1) {
+		&generateCount($jfProg, $dataDirT1, $kmerCount1_tmp, $kmerSize, $jfSize);
+		move($kmerCount1_tmp,$kmerCount1);
+} else {
+	$log->warn("##### Skip kmer count generation as file exists: ${kmerCount1}");
+}
+$fm->finish() if ($fm);
+
+KMERCOUNT2:
+# The parent does the second count
+unless (-e $kmerCount2) {
+	&generateCount($jfProg, $dataDirT2, $kmerCount2_tmp, $kmerSize, $jfSize);
+	move($kmerCount2_tmp,$kmerCount2);
+} else {
+	$log->warn("##### Skip kmer count generation as file exists: ${kmerCount2}");
+}
+
+$fm->wait_all_children if ($fm);
+
+
+## Normalisation and kmer matching
+$log->info("##### Normalisation and kmer matching");
+
+# Split the kmer sets into smaller sets for allowing parallel processing
+my $splitMerNum=$cfg->val('advanced', 'mer_split_num');
+my $splitMerProg=$diffkapDir . $prog_splitInMer;
+my $kmerSplitDir;
+my $kmerSplitDir_tmp;
+
+
+# Get a child to do one split
+$pid=$fm->start("Split based on mer $kmerCount1") and goto KMERSPLIT2 if ($fm);
+$kmerSplitDir=$kmerOutDir.'/'.basename($dataDirT1)."_${kmerSize}mer_count_split";
+$kmerSplitDir_tmp=$kmerSplitDir.'.tmp';
+unless (-d $kmerSplitDir) {
+	$cmd="perl ${splitMerProg} -splitNum ${splitMerNum} -outDir $kmerSplitDir_tmp ${kmerCount1}";
+	$log->debug($cmd);
+	if ( system($cmd) != 0 ) {
+		$log->error("Error in running $splitMerProg for $kmerCount1");
+		exit 1;
+	}
+	move($kmerSplitDir_tmp,$kmerSplitDir);
+} else {
+	$log->warn("Skip splitting kmer files as directory exists: $kmerSplitDir");
+}
+$fm->finish() if ($fm);
+
+
+KMERSPLIT2:
+# Get another child to do one split
+
+$pid=$fm->start("Split based on mer $kmerCount2") and goto FINDTOTAL if ($fm);
+$kmerSplitDir=$kmerOutDir.'/'.basename($dataDirT2)."_${kmerSize}mer_count_split";
+$kmerSplitDir_tmp=$kmerSplitDir.'.tmp';
+unless (-d $kmerSplitDir) {
+	$cmd="perl ${splitMerProg} -splitNum ${splitMerNum} -outDir ${kmerSplitDir_tmp} ${kmerCount2}";
+	$log->debug($cmd);
+	if ( system($cmd) != 0 ) {
+		$log->error("Error in running $splitMerProg for $kmerCount2");
+		exit 1;
+	}
+	move($kmerSplitDir_tmp,$kmerSplitDir);
+} else {
+	$log->warn("Skip splitting kmer files as directory exists: $kmerSplitDir");
+}
+$fm->finish() if ($fm);
+
+
+FINDTOTAL:
+# The parent doesn't the find total while the 2 children performing split
+
+## Identify and annotate DERs 
+$log->info("##### Finding Total Kmer Occurrance");
+
+# Find max total occurrence of the two kmer datasets for normalisation
+my $findTotalProg=$diffkapDir . $prog_findTotal;
+my $totalOutFile="${kmerOutDir}/${t1ID}-${t2ID}_totalOccur.log";
+my $totalOutFile_tmp=$totalOutFile.'.tmp';
+
+unless (-e $totalOutFile) {
+	$cmd="sh ${findTotalProg} -o ${totalOutFile_tmp} ${kmerOutDir}/*.tsv";
+	$log->debug($cmd);
+	if ( system($cmd) != 0 ) {
+		$log->error("Error in running $findTotalProg");
+		exit 1;
+	}
+	move($totalOutFile_tmp,$totalOutFile);
+} else {
+	$log->warn("Skip finding total as file exists: $totalOutFile");
+}
+
+$fm->wait_all_children if ($fm);
+
+
+# Remove duplicates of the raw data and split the file for parallel computing
+my $SeqSplitNum=$cfg->val('advanced', 'seq_split_num');
+my $derOutDir=$outDir.'/'.DER_OUT_DIR_NAME;
+make_path($derOutDir) unless (-d $derOutDir);
+my $uniqReadOutFile="$derOutDir/${t1ID}-${t2ID}_allSeq_uniqRead.fasta";
+my $uniqReadProg=$diffkapDir . $prog_rmDupSplit;
+my $readType=$cfg->val('general', 'seq_read');
+
+my @files1=<${dataDirT1}/*>;
+my @files2=<${dataDirT2}/*>;
+my $files=join(' ',@files1).' '.join(' ',@files2);
+
+
+# Check if all files in both T1 and T2 directories have the same file format and get what it is
+my ($informat, $numLinePerRead)=isFaOrFq($files1[0]);
+for (my $i=1; $i<scalar(@files1); $i++) {
+	my ($thisFormat, $thisNumLinePerRead)=isFaOrFq($files1[$i]);
+	if ("$thisFormat" ne "$informat") {
+		$log->error("Error: Not all T1 data files having the same format, $files1[$i] - $thisFormat, previous checked file(s) - $informat");
+		exit 1;
+	}
+	if ("$thisNumLinePerRead" ne "$numLinePerRead") {
+		$log->error("Error: Not all T1 data files having the same number of lines, $files1[$i] - $thisNumLinePerRead, previous checked file(s) - $numLinePerRead");
+		exit 1;
+	}
+}
+
+my $afile;
+foreach $afile (@files2) {
+	my ($thisFormat, $thisNumLinePerRead)=isFaOrFq($afile);
+	if ("$thisFormat" ne "$informat") {
+		$log->error("Error: Not all T1 & T2 data files having the same format, $afile - $thisFormat, previous checked file(s) - $informat");
+		exit 1;
+	}
+	if ("$thisNumLinePerRead" ne "$numLinePerRead") {
+		$log->error("Error: Not all T1 & T2 data files having the same number of lines, $afile - $thisNumLinePerRead, previous checked file(s) - $numLinePerRead");
+		exit 1;
+	}
+}
+
+	
+my $regenUniqRead=$cfg->val('advanced', 'regenerate_uniq_read');
+
+# Start generating unique read set in a child
+$pid=$fm->start("Generate unique read set") and goto MATCHKMER if ($fm);
+
+if ($regenAllResults==0 && $regenUniqRead > 0 && glob("$derOutDir/${t1ID}-${t2ID}_allSeq_uniqRead*")) {
+	$log->warn("As REGENERATE_ALL_RESULTS is unset but REGENERATE_UNIQ_READ is set, all previously generated unique read files were deleted and regenerating.");
+	unlink <$derOutDir/${t1ID}-${t2ID}_allSeq_uniqRead*>;
+}
+
+if ( ! -e "${uniqReadOutFile}.0" ) {
+	$cmd="perl ${uniqReadProg} -n ${SeqSplitNum} -informat ${informat} -numOfLinePerRead $numLinePerRead -outFile1 ${uniqReadOutFile} ${files}";
+	$log->debug($cmd);
+	if (system($cmd) != 0 ) {
+		$log->error("Error in running $uniqReadProg");
+		exit 1;
+	}
+} else {
+	$log->warn("Skip generating unique read set as file exists: ${uniqReadOutFile}.0");
+}
+
+$fm->finish() if ($fm);
+
+
+MATCHKMER:
+# Perform normalisation and matching kmers for the two datasets
+my $totalNumOfSplit = 4 ** $splitMerNum;
+my $MinDiff = $cfg->val('advanced', 'min_diff');
+my $MinFoldChange = $cfg->val('advanced', 'min_fold_change');
+my $dekOutDir=$outDir.'/'.DEK_OUT_DIR_NAME;
+make_path($dekOutDir) unless (-d $dekOutDir);
+
+my $normMatchProg=$diffkapDir . $prog_normMatch;
+for (my $i=0; $i < $totalNumOfSplit; $i++) {
+
+	# Get all children to do the DEK finding
+	$pid=$fm->start("NormMatch for sub kmer file $i") and next if ($fm);
+
+	my $inFile1 = $kmerCount1;
+	$inFile1 =~ s/\.tsv$/_split\//;
+	$inFile1 .= basename($kmerCount1).".${i}";
+	my $inFile2 = $kmerCount2;
+	$inFile2 =~ s/\.tsv$/_split\//;
+	$inFile2 .= basename($kmerCount2).".${i}";
+	my $normMatchOutFile = "${dekOutDir}/${t1ID}-${t2ID}_DEK.tsv.${i}";
+	my $normMatchOutFile_tmp = $normMatchOutFile.'.tmp';
+
+	unless (-e $normMatchOutFile) {
+		$cmd="perl ${normMatchProg} -outfile ${normMatchOutFile_tmp} -totalOccurFile ${totalOutFile} -minDiff ${MinDiff} -minFoldChange ${MinFoldChange} ${inFile1} ${inFile2}";
+		$log->debug($cmd);
+		if (system($cmd) != 0 ) {
+			$log->error("Error in running $normMatchProg");
+			exit 1;
+		}
+		move($normMatchOutFile_tmp,$normMatchOutFile);
+	} else {
+		$log->warn("Skip normalisation and match as file exists: $normMatchOutFile");
+	}
+
+	$fm->finish() if ($fm);
+}
+
+$fm->wait_all_children if ($fm);
+
+
+
+## Identify and annotate DERs 
+$log->info("##### Identify and annotate DERs");
+
+
+# Identify and annotate DERs, and parse unannotated and annotated DERs into tabular form
+my @seqFiles=<${uniqReadOutFile}.*>;
+my $identDERProg=$diffkapDir . $prog_identDER;
+my @dekFiles=<${dekOutDir}/*>;
+
+my $blastxProg=($cfg->val('pro_dir','blastx')?$cfg->val('pro_dir','blastx').'/':'').'blastx';
+my $SP_DB=$cfg->val('annotation','db');
+my $evalue=$cfg->val('annotation','evalue');
+
+for (my $i=0; $i < scalar(@seqFiles); $i++) {
+
+	# Identify DER, this step requires more momory so will be run sequentially
+	my $seqFile=$seqFiles[$i];
+	my $DERseqOutFile=$seqFile;
+	my $DERinfoOutFile=$seqFile;
+	$DERseqOutFile=~s/\.fasta\./_DER_seq.fasta./;
+	my $DERseqOutFile_tmp=$DERseqOutFile.'.tmp';
+	$DERinfoOutFile=~s/\.fasta\./_DER_info.fasta./;
+	my $DERinfoOutFile_tmp=$DERinfoOutFile.'.tmp';
+	unless (-e $DERseqOutFile && -e $DERinfoOutFile) {
+		$cmd="perl ${identDERProg} -a ${seqFile} -kmerFileFormat occurNratio -derSeqOutFile $DERseqOutFile_tmp -derInfoOutFile $DERinfoOutFile_tmp ".join(' ', @dekFiles);
+		$log->debug($cmd);
+		if (system($cmd) != 0 ) {
+			$log->error("Error in running $identDERProg");
+			exit 1;
+		}
+		move($DERseqOutFile_tmp,$DERseqOutFile);
+		move($DERinfoOutFile_tmp,$DERinfoOutFile);
+	} else {
+		$log->debug("Skip identify DER as files exist: $DERseqOutFile and $DERinfoOutFile");
+	}
+
+
+	# Get children to perform annotation
+	$pid=$fm->start("Annotation and parsing for $DERseqOutFile") and next if ($fm);
+
+	# Annotate the reads
+	$seqFile =~ s/\.fasta\./_DER_seq.fasta./;
+	my $blastxOutFile=$seqFile;
+	$blastxOutFile=~s/\.fasta\./.blastx./;
+	my $blastxOutFile_tmp=$blastxOutFile.'.tmp';
+	unless (-e $blastxOutFile) {
+		$cmd="${blastxProg} -db ${SP_DB} -query ${seqFile} -show_gis -num_descriptions 1 -num_alignments 1 -out ${blastxOutFile_tmp}";
+		$log->debug($cmd);
+		if (system($cmd) != 0) {
+			$log->error("Error in running $blastxProg");
+			exit 1;
+		}
+		move($blastxOutFile_tmp,$blastxOutFile);
+	} else {
+		$log->warn("Skip blastx as file exists: $blastxOutFile");
+	}
+
+	# Parse the blastx results
+	my $isHeader='-noOutHeader';
+	$isHeader='' if ($seqFiles[$i]=~m/fasta\.0$/);
+	my $infoFile=$seqFile;
+	$infoFile=~s/_seq\.fasta\./_info.fasta./;
+	my $allReadsOutFile=$seqFile;
+	$allReadsOutFile=~s/_seq\.fasta/.tsv/;
+	my $allReadsOutFile_tmp=$allReadsOutFile.'.tmp';
+	my $blastParserProg=$diffkapDir . $prog_blastParser;
+	unless (-e $allReadsOutFile) {
+		$cmd="perl ${blastParserProg} ${isHeader} -eval ${evalue} -seq ${seqFile} -info ${infoFile} -out ${allReadsOutFile_tmp} ${blastxOutFile}";
+		$log->debug($cmd); 
+		if ( system($cmd) != 0 ) {
+			$log->error("Error in running $blastParserProg for AllDERs");
+			exit 1;
+		}
+		move($allReadsOutFile_tmp,$allReadsOutFile);
+	} else {
+		$log->warn("Skip parsing ALL-DER as file exists: $allReadsOutFile");
+	}
+
+	# Parse the blastx results only for reads with annotation 
+	my $onlyHitOutFile=$seqFile;
+	$onlyHitOutFile=~s/_seq\.fasta/_onlyHit.tsv/;
+	my $onlyHitOutFile_tmp=$onlyHitOutFile.'.tmp';
+	unless (-e $onlyHitOutFile) {
+		$cmd="perl ${blastParserProg} ${isHeader} -onlyHits -eval ${evalue} -seq ${seqFile} -info ${infoFile} -out ${onlyHitOutFile_tmp} ${blastxOutFile}";
+		$log->debug($cmd);
+		if ( system($cmd) != 0 ) {
+			$log->error("Error in running $blastParserProg for AnnotatedDERs");
+			exit 1;
+		}
+		move($onlyHitOutFile_tmp,$onlyHitOutFile);
+	} else {
+		$log->warn("Skip parsing annotated DER as file exists: $onlyHitOutFile");
+	}
+
+	$fm->finish() if ($fm);
+
+}
+
+$fm->wait_all_children if ($fm);
+
+
+## Generate human-friendly results
+$log->info("##### Generate results");
+
+my $resultOutDir=$outDir . '/'.RESULT_OUT_DIR_NAME;
+make_path($resultOutDir) unless (-d $resultOutDir);
+
+# Combine all split DER files and put to the result directory
+my @derSplitedFiles=<${derOutDir}/${t1ID}-${t2ID}_allSeq_uniqRead_DER.tsv.*>;
+my $derFile="${derOutDir}/${t1ID}-${t2ID}_AllDER.tsv";
+&formatResults(join(' ',@derSplitedFiles), $derFile, $resultOutDir);
+
+
+# Combine all split annotated DER files and put to the result directory
+my @derOnlyHitSplitedFiles=<${derOutDir}/${t1ID}-${t2ID}_allSeq_uniqRead_DER_onlyHit.tsv.*>;
+my $derOnlyHitFile="${derOutDir}/${t1ID}-${t2ID}_AnnotatedDER.tsv";
+&formatResults(join(' ',@derOnlyHitSplitedFiles), $derOnlyHitFile, $resultOutDir);
+
+# Get the gene-based display summary for all annotated DER
+$log->info("*** Generate gene-centric result file");
+
+my $geneBaseDispProg = $diffkapDir . $prog_geneBasedDisp;
+my $minDER2Report=$cfg->val('advanced', 'min_der_to_report');
+my @annotatedDERsubFiles=<${derOutDir}/${t1ID}-${t2ID}_AnnotatedDER_*>;
+my $DEGTmpFile1="${resultOutDir}/${t1ID}-${t2ID}_DEG_minDER${minDER2Report}.tmp1";
+my $DEGTmpFile2="${resultOutDir}/${t1ID}-${t2ID}_DEG_minDER${minDER2Report}.tmp2";
+my $DEGfile="${resultOutDir}/${t1ID}-${t2ID}_DEG_minDER${minDER2Report}.tsv";
+$cmd="perl ${geneBaseDispProg} -infoCol 15 -keyCol 12 -minDERout ${minDER2Report} -o ${DEGfile} ". join(' ',@annotatedDERsubFiles);
+$log->debug($cmd);
+if ( system($cmd) != 0 ) {
+	$log->error("Error in running $geneBaseDispProg");
+	exit 1;
+}
+
+
+# sort the summary file based in reverse order on the total column
+system("head -n 1 ${DEGfile} > ${DEGTmpFile1}");
+system("tail -n+2 ${DEGfile} > ${DEGTmpFile2}");
+my @cmd=("sort", "-k8", "-rn", "-t", "\t", "-o", "${DEGTmpFile2}", "${DEGTmpFile2}");
+system(@cmd);
+system("cat ${DEGTmpFile1} ${DEGTmpFile2} > ${DEGfile}");
+unlink ${DEGTmpFile1};
+unlink ${DEGTmpFile2};
+
+# Generate a summary report
+$log->info("*** Generate summary report");
+
+my $summaryReportProg=$diffkapDir . $prog_sumReport;
+$cmd="sh ${summaryReportProg} -a ${t1ID} -b ${t2ID} -e $evalue -n ${numLinePerRead} -o ${outDir} -f ${informat} -k ${kmerSize} -x ${dataDirT1} -y ${dataDirT2} -m ${minDER2Report} -d ${MinDiff} -c ${MinFoldChange}";
+$log->debug($cmd);
+if ( system($cmd) != 0 ) {
+	$log->error("Error in running $summaryReportProg");
+	exit 1;
+}
+
+
+
+my $endTime = time;
+my $duration = $endTime - $startTime;
+&printTime("################### End at");
+
+$log->info("################### Duration: " . strftime("\%H:\%M:\%S", gmtime($duration)));
+
+
+
+
+########## functions ##########
+
+sub formatResults {
+	my ($splitedFiles, $derFile, $resultDir) = @_;
+	$log->info("splitedFile: $splitedFiles");
+	$log->info("derFile: $derFile");
+	$log->info("resultDir: $resultDir");
+
+	my $splitSubGroupProg = $diffkapDir . $prog_splitSubGroup;
+
+	$log->debug("cat ${splitedFiles} > ${derFile}");
+	`cat ${splitedFiles} > ${derFile}`;
+
+	my $lowerValue = 1/$MinFoldChange;
+	my $upperValue = $MinFoldChange;
+
+	$log->debug("lowerValue: $lowerValue, upperValue: $upperValue");
+
+	# Split results files into groups based on differential expression level
+	$cmd="perl ${splitSubGroupProg} -column 4 -r \"0,1-Absent-in-${t1ID}\" -r \"(0,$lowerValue),2-Highly-expressed-in-${t2ID}\" -r \"[$lowerValue,$upperValue],3-None-differentially-expressed\" -r \"($upperValue,inf),4-Highly-expressed-in-${t1ID}\" -r \"inf,5-Absent-in-${t2ID}\" ${derFile}";
+	$log->debug($cmd);
+	if ( system($cmd) != 0 ) {
+		$log->error("Error in running $splitSubGroupProg for $derFile");
+		exit 1;
+	}
+
+	# Generate a neat version for the results
+	my $allSubGroupFilesPattern=$derFile;
+	$allSubGroupFilesPattern =~ s/\.tsv$//;
+	my @allSubGroupFiles=<${allSubGroupFilesPattern}_*>;
+	
+	for (my $i=0; $i < scalar(@allSubGroupFiles); $i++) {
+		my $neatFilename=basename($allSubGroupFiles[$i]);
+		$neatFilename=~s/\.tsv$/_neat.tsv/;
+		$neatFilename = $resultDir . '/' . $neatFilename;
+
+		$log->debug("cat ${allSubGroupFiles[$i]} | cut -f1,2,3,4,5,6,8,12,15,18 > ${neatFilename}");
+		`cat ${allSubGroupFiles[$i]} | cut -f1,2,3,4,5,6,8,12,15,18 > ${neatFilename}`;
+	}
+}
+
+
+sub generateCount {
+	my ($jfProg, $dataDir, $outFile, $kmerSize, $jfHashSize) = @_;
+
+	$log->info("##### Generate kmer counts for ".$dataDir);
+
+	my $jfCountOut=$outFile;
+	$jfCountOut=~s/\.tsv/.jf/;
+	my $jfMergeOut=$outFile;
+	$jfMergeOut=~s/_count\.tsv/_merged.jf/;
+
+	my @files=<${dataDir}/*>;
+	$cmd="${jfProg} count -m ${kmerSize} -s ${jfHashSize} -o ${jfCountOut} ".join(' ',@{files});
+	$log->debug($cmd);
+	if ( system($cmd) != 0 ) {
+		$log->error("Error in running $jfProg count");
+		exit 1;
+	}
+
+	@files=<${jfCountOut}_*>;
+	my $files=join(' ', @files);
+	if (scalar(@files)>1) {
+		$cmd="${jfProg} merge -o ${jfMergeOut} ${files}";
+		$log->debug($cmd);
+		if ( system($cmd) != 0 ) {
+			$log->error("Error in running $jfProg merge");
+			exit 1;
+		}
+		$log->debug( "unlink ${files}" );
+		unlink @{files};
+	} else {
+		# if the jellyfish hash size is big enough, only a single count file is there, no merge is required.
+		if ( move($files,${jfMergeOut}) != 1 ) {
+			$log->error("Error in renaming $files to ${jfMergeOut}: $!");
+			exit 1;
+		}
+	}
+
+	$cmd="${jfProg} dump -c -t ${jfMergeOut} > ${outFile}";
+	$log->debug($cmd);
+	if ( system($cmd) != 0 ) {
+		$log->error("Error in running $jfProg dump");
+		exit 1;
+	}
+	$log->debug("unlink $jfMergeOut");
+	unlink ${jfMergeOut};
+}
+
+
+sub readConfig {
+	my ($configFile)=@_;
+	$log->info("##### Reading configuration file: $configFile");
+	my $cfg = Config::IniFiles->new( -file=>"$configFile", -nocase=>1 );
+	
+	# Verify all required variables are contained in the configuration file
+	&_validateVar($cfg);
+
+	return $cfg;
+}
+
+
+sub _validateVar {
+	my ($cfg)=@_;
+	my $isMiss=0;
+
+	# For general section
+	my $sec='GENERAL';
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'NUM_OF_PROCESSOR');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'T1_ID');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'T2_ID');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'KMER_SIZE');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'OUT_DIR');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T1');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T2');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'SEQ_READ');
+	if ( $cfg->val($sec, 'SEQ_READ') && $cfg->val($sec, 'SEQ_READ') eq 'pair' ) {
+		$log->error("As 'SEQ_READ' is set to 'pair', DATA_DIR_T1_B and DATA_DIR_T2_B are required" ); 
+		$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T1_B');
+		$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T2_B');
+
+		######## Currently only support SEQ_READ=single ###########
+		$log->error("As we have only tested the results throughly on illumina single end data, this auto run pipeline only support this type of data. \nPlease contact Kenneth (c.chan10\@uq.edu.au) for running pair-end datasets.");
+		exit 1;
+	}
+
+
+	$sec='ANNOTATION';
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DB');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'EVALUE');
+
+	$sec='ADVANCED';
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'MER_SPLIT_NUM');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'MIN_DIFF');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'MIN_FOLD_CHANGE');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'MIN_DER_TO_REPORT');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'SEQ_SPLIT_NUM');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'JELLYFISH_HASH_SIZE');
+
+	if ($isMiss) {
+		$log->error( "------------------------------------------------------------------------");
+		$log->error( "Exit with errors: Missing the aboved variables in the configuration file");
+		$log->error( "########################################################################");
+		exit 1; 
+	}
+	
+}
+
+
+sub _checkMissExpandVar {
+	my ($cfg, $sec, $var) = @_;
+
+	## Check if the required variable is missing
+	if (!$cfg->val($sec, $var)) {
+		my $str="Missing value for variable \'$var\' in section \'$sec\'";
+		$log->error( $str ); 
+		return 1;
+	} 
+
+	## Expand the linux path symbols
+	my $oldVal=$cfg->val($sec, $var);
+	if ($oldVal=~'^~') {
+		$oldVal =~ s/^~/${ENV{HOME}}/;
+		$cfg->newval($sec, $var, $oldVal);
+	} elsif ($oldVal=~'^\.\.') {
+		my $pwd=dirname(getcwd());
+		$oldVal =~ s/^\.\./${pwd}/;
+		$cfg->newval($sec, $var, $oldVal);
+	} elsif ($oldVal=~'^\.') {
+		my $pwd=getcwd();
+		$oldVal =~ s/^\./${pwd}/;
+		$cfg->_checkMissExpandVarnewval($sec, $var, $oldVal);
+	}
+
+	return 0;
+}
+
+
+__DATA__
+
+=head1 NAME
+
+DiffKAP - This is a differential k-mer analysis pipeline.
+
+
+=head1 SYNOPSIS
+
+DiffKAP.pl [-help] [-man] <configurationFile>
+
+B<Example>
+
+DiffKAP sampleProject.cfg
+
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=back
+
+
+=head1 DESCRIPTION
+
+This is a pipeline for identifying differentially expressed genes between two RNA-Seq datasets.
+For more information, see L<http://www.appliedbioinformatics.com.au/index.php/DiffKAP>
+
+
+=head1 LICENSE
+
+Copyright (c) 2012,2013 Chon-Kit Kenneth Chan. All rights reserved.
+
+This script is freely available for non-commercial use 
+and is covered by the GNU General Public License v3 or later. 
+See L<http://www.gnu.org/licenses/gpl.html>
+
+The user of the script agrees to acknowledge the author(s) in any 
+scientific publication of results based in part on the use of the script.
+
+=cut
+

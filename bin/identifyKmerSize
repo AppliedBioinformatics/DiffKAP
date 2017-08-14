@@ -1,0 +1,419 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use IO::Handle;
+use Getopt::Long;
+use Pod::Usage;
+
+use Config::IniFiles; 
+use File::Basename;
+use Cwd 'abs_path';
+use Log::Log4perl;
+
+use Parallel::ForkManager;
+use GD::Graph::linespoints;
+
+use lib dirname(abs_path($0));
+use Point;
+use CumulativePlot;
+
+
+use vars qw($logconfFilename $isOutputCount);
+
+BEGIN {
+	STDERR->autoflush(1);
+	STDOUT->autoflush(1);
+}
+
+
+### Programs used
+my $prog_jellyfish='jellyfish';
+
+
+### Set up logger
+$logconfFilename = dirname(abs_path($0)).'/log.conf' if (!$logconfFilename);
+Log::Log4perl->init($logconfFilename);
+my $log=Log::Log4perl->get_logger();
+
+
+########## options ##########
+my ( $help, $man, $DEBUG );
+my $imgW=800;
+my $imgH=800;
+my $verboseLv=2;
+GetOptions(
+		'help|?' => \$help, 
+		'man' => \$man,
+		'debug' =>\$DEBUG,
+		'logConfig=s' => \$logconfFilename,
+		'outputCount' => \$isOutputCount,
+		'imageWidth=i' => \$imgW,
+		'imageLength=i' => \$imgH,
+		'verboseLevel=i' => \$verboseLv,
+	) or pod2usage(2);
+pod2usage(1) if $help;
+pod2usage(1) if ($verboseLv<0 || $verboseLv>2);
+pod2usage(-verbose => 2) if $man;
+
+
+########## arguments ##########
+if (@ARGV != 1) {
+	$log->error("Incorrect number of argument");
+	pod2usage("***** Error: a configuration file is required *****");
+}
+
+
+
+my $optKmerStr='Suggested kmer size = ';
+
+########## program start ##########
+&printTime("################### Start at") if ($verboseLv>1);
+
+
+##### Read in configuration file
+my $cfg=&readConfig( $ARGV[0] );
+
+
+##### Run through the pipeline
+
+## Extract some common variables from the configuration file
+my $dataDirT1=$cfg->val('general','data_dir_t1');
+my $dataDirT2=$cfg->val('general','data_dir_t2');
+my $minKmerSize=$cfg->val('identifykmersize','min_kmer_size');
+my $maxKmerSize=$cfg->val('identifykmersize','max_kmer_size');
+my $t1ID=$cfg->val('general','t1_id');
+my $t2ID=$cfg->val('general','t2_id');
+my $numOfCPU=$cfg->val('general','num_of_processor');
+my $jfSize=$cfg->val('advanced','jellyfish_hash_size');
+my $outDir=$cfg->val('general','out_dir').'/'.$t1ID.'-'.$t2ID;
+
+
+my $identifyKmerOutDir=$outDir.'/identifyKmerSize';
+
+
+my $optimalKmerSizeFile=$identifyKmerOutDir.'/'. "${t1ID}-${t2ID}_${minKmerSize}mer-${maxKmerSize}mer_optimalKmerSize.txt";
+
+if (-e $optimalKmerSizeFile) {
+	$log->warn("The optimalKmerSize file exist [$optimalKmerSizeFile]. Using the optimal kmer size in the file.") if ($verboseLv>0);
+	open(OPTKMERSIZE, "<$optimalKmerSizeFile") or die $!;	
+	my $optKmerLine=<OPTKMERSIZE>;
+	my ($optKmerSize)=$optKmerLine=~m/^$optKmerStr(\d+)$/;
+	if ($optKmerSize) {
+		print $optKmerStr . $optKmerSize . "\n";
+		&printTime("################### End at") if ($verboseLv>1);
+		exit;
+	} else {
+		$log->warn("Couldn't find the optimal kmer size string in the optimal kmer size file. Continue searching for optimal kmer size..") if ($verboseLv>0);
+	}
+}
+
+
+## Set up the fork manager
+my $maxNumOfChild=$numOfCPU;
+my $pid;
+my @allUniqRatio;
+
+my $fm;
+$fm = new Parallel::ForkManager($maxNumOfChild) if ($maxNumOfChild>0);
+
+if ($fm) {
+  $fm->run_on_start(
+    sub {
+      my ($pid, $ident)=@_;
+      $log->info("*** Start $pid: $ident ***") if ($verboseLv>0);
+    }   
+  );  
+  $fm->run_on_finish(
+    sub {
+      my ($pid, $exist_code, $ident, $a, $b, $info) = @_; 
+
+			# Collect the value from child to parent
+			my ($k, $uniqR)=$$info=~m/^(\d+)\t(.+)$/;
+			$allUniqRatio[$k]=$uniqR;
+
+      $log->info("*** Finished $pid: $ident ***") if ($verboseLv>0);
+    }   
+  );  
+}
+
+
+## Apply jellyfish to find out uniqueness ratio for all required kmer size
+`mkdir -p $identifyKmerOutDir` if (! -d $identifyKmerOutDir);
+
+
+my $allDataFiles="${dataDirT1}/* ${dataDirT2}/*";
+
+if ( $cfg->val('GENERAL', 'SEQ_READ') && $cfg->val('GENERAL', 'SEQ_READ') eq 'pair' ) {
+	my $dataDirT1B=$cfg->val('GENERAL','DATA_DIR_T1_B');
+	my $dataDirT2B=$cfg->val('GENERAL','DATA_DIR_T2_B');
+	$allDataFiles.= " ${dataDirT1B}/* ${dataDirT2B}/*";
+}
+
+my $kmerOutDir=$outDir.'/kmerCount';
+my $jfProg=($cfg->val('pro_dir', 'jellyfish')?$cfg->val('pro_dir', 'jellyfish').'/':'') . $prog_jellyfish;
+my $files=`ls ${allDataFiles} | awk '{ORS=" "; print;}'`;
+for (my $k=$minKmerSize; $k<=$maxKmerSize; $k++) {
+
+	$pid = $fm->start("kmer counting for ${k}mer") and next if ($fm);
+
+
+	my $jfCountOut=$identifyKmerOutDir.'/'. "${t1ID}-${t2ID}_${k}mer_count.jf";
+	my $jfMergeOut=$identifyKmerOutDir.'/'. "${t1ID}-${t2ID}_${k}mer_merged.jf";
+
+	$log->debug("$jfProg count -m ${k} -s ${jfSize} -o ${jfCountOut} $files");
+	if ( system("$jfProg count -m ${k} -s ${jfSize} -o ${jfCountOut} $files") != 0 ) {
+		$log->error("Error in running $jfProg count");
+		exit 1;
+	}
+	
+	my $cmd;
+	my @allSubCountFiles=<${jfCountOut}_*>;
+	my $allSubCountFiles=join(' ',@allSubCountFiles);
+	if (scalar(@allSubCountFiles)>1) {
+		$cmd="${jfProg} merge -o ${jfMergeOut} $allSubCountFiles";
+		$log->debug($cmd);
+		if ( system($cmd) != 0 ) {
+			$log->error("Error in running $jfProg merge");
+			exit 1;
+		}		
+		$log->debug("rm $allSubCountFiles");
+		`rm ${allSubCountFiles}`;
+	} else {
+		$cmd="mv $allSubCountFiles ${jfMergeOut}";
+		$log->debug($cmd);
+		if ( system($cmd) != 0 ) {
+			$log->error("Error in renaming $files to ${jfMergeOut}");
+			exit 1;
+		}
+	}
+	
+
+	if ($isOutputCount) {
+		my $kmerCount=$kmerOutDir . '/' . "${t1ID}-${t2ID}_${k}mer_count.tsv";
+		`mkdir -p $kmerOutDir` if (! -d $kmerOutDir);
+
+		$log->debug("$jfProg dump -c -t $jfMergeOut > $kmerCount");
+		if ( system("$jfProg dump -c -t $jfMergeOut > $kmerCount") != 0 ) {
+			$log->error("Error in running $jfProg dump");
+			exit 1;
+		}
+	}
+
+	$log->debug("$jfProg stats $jfMergeOut");
+	my $thisStats=`$jfProg stats $jfMergeOut`;
+
+	my ($distinct, $total)=$thisStats=~m/Distinct:\s+(\d+)\nTotal:\s+(\d+)/;
+	my $uniqRatio=$distinct/$total*100;
+	$uniqRatio=sprintf("%.2f",$uniqRatio);
+
+	#$allUniqRatio[$k]=$uniqRatio;
+
+	$log->debug("rm $jfMergeOut");
+	`rm $jfMergeOut`;
+
+
+	my $tmpStr="$k\t$uniqRatio";
+	$fm->finish(0, \$tmpStr) if ($fm);
+}
+
+$fm->wait_all_children if ($fm);
+
+
+# Generate the uniqueness ratio log and plot
+my $uniqRatioLog=$identifyKmerOutDir.'/'. "${t1ID}-${t2ID}_${minKmerSize}mer-${maxKmerSize}mer.txt";
+my $uniqRatioPlot=$identifyKmerOutDir.'/'. "${t1ID}-${t2ID}_${minKmerSize}mer-${maxKmerSize}mer.png";
+my @data;
+my @dataPointArray;
+
+open my $outFH, ">$uniqRatioLog" || die $!;
+print $outFH "Kmer\tUniqueness Ratio (%)\n";
+
+for (my $k=$minKmerSize; $k<=$maxKmerSize; $k++) {
+	# output the log file
+	print $outFH "$k\t$allUniqRatio[$k]\n";
+	
+	# collect data for plotting
+	my $kLabel = $k . "mer";
+	push(@{$data[0]}, $kLabel);
+	push(@{$data[1]}, $allUniqRatio[$k]);
+	push(@dataPointArray, new Point($k, $allUniqRatio[$k]));
+}
+
+my $graph = GD::Graph::linespoints->new($imgW, $imgH);
+
+$graph->set(
+			x_label           => 'Kmer Size',
+			y_label           => 'Uniqueness Ratio (%)',
+			title             => "Uniqueness Ratio Plot for ${t1ID}-${t2ID}",
+	) or die $graph->error;
+
+my $gd = $graph->plot(\@data) or die $graph->error;
+
+open(IMG, ">$uniqRatioPlot") or die $!;
+print IMG $graph->plot(\@data)->png;
+
+
+# Output the suggested kmer size at the knee point
+my $cPlot = new CumulativePlot(\@dataPointArray);
+my $kneePoint = $cPlot->getKneePoint;
+
+print $optKmerStr . $kneePoint->x . "\n";
+
+
+
+open(OPTKMERSIZE, ">$optimalKmerSizeFile") or die $!;
+print OPTKMERSIZE $optKmerStr . $kneePoint->x . "\n";
+
+
+&printTime("################### End at") if ($verboseLv>1);
+
+
+########## functions ##########
+sub printTime {
+  my $message = "Current Time";
+  ($message) = @_ if (@_ >= 1); 
+
+  $log->info("$message: " . scalar(localtime(time)));
+}
+
+
+sub readConfig {
+	my ($configFile)=@_;
+	$log->info("##### Reading configuration file: $configFile") if ($verboseLv>0);
+	my $cfg = Config::IniFiles->new( -file=>$configFile, -nocase=>1 );
+
+	# Verify all required variables are contained in the configuration file
+	&_validateVar($cfg);
+
+	return $cfg;
+}
+
+
+sub _validateVar {
+	my ($cfg)=@_;
+	my $isMiss=0;
+
+	# For general section
+	my $sec='GENERAL';
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'NUM_OF_PROCESSOR');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'T1_ID');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'T2_ID');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'OUT_DIR');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T1');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T2');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'SEQ_READ');
+	if ( $cfg->val($sec, 'SEQ_READ') && $cfg->val($sec, 'SEQ_READ') eq 'pair' ) {
+		$log->error("As 'SEQ_READ' is set to 'pair', DATA_DIR_T1_B and DATA_DIR_T2_B are required" ); 
+		$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T1_B');
+		$isMiss |= &_checkMissExpandVar($cfg, $sec, 'DATA_DIR_T2_B');
+	}
+
+	$sec='IDENTIFYKMERSIZE';
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'MIN_KMER_SIZE');
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'MAX_KMER_SIZE');
+
+	$sec='ADVANCED';
+	$isMiss |= &_checkMissExpandVar($cfg, $sec, 'JELLYFISH_HASH_SIZE');
+
+	if ($isMiss) {
+		$log->error( "------------------------------------------------------------------------");
+		$log->error( "Exit with errors: Missing the aboved variables in the configuration file");
+		$log->error( "########################################################################");
+		exit 1; 
+	}
+}
+
+
+sub _checkMissExpandVar {
+	my ($cfg, $sec, $var) = @_;
+
+	## Check if the required variable is missing
+	my $str="Missing value for variable \'$var\' in section \'$sec\'";
+	if (!$cfg->val($sec, $var)) {
+		$log->error( $str ); 
+		return 1;
+	} 
+
+	## Expand the linux path symbols
+	my $oldVal=$cfg->val($sec, $var);
+	if ($oldVal=~'^~') {
+		$oldVal =~ s/^~/${ENV{HOME}}/;
+		$cfg->newval($sec, $var, $oldVal);
+	} elsif ($oldVal=~'^\.\.') {
+		my $pwd=dirname(getcwd());
+		$oldVal =~ s/^\.\./${pwd}/;
+		$cfg->newval($sec, $var, $oldVal);
+	} elsif ($oldVal=~'^\.') {
+		my $pwd=getcwd();
+		$oldVal =~ s/^\./${pwd}/;
+		$cfg->newval($sec, $var, $oldVal);
+	}
+
+	return 0;
+}
+
+
+__DATA__
+
+=head1 NAME
+
+identifyKmerSize - This script will streamline the process of generating a uniqueness plot
+
+
+=head1 SYNOPSIS
+
+identifyKmerSize [-help] [-man] [-outputCount] [-imageWidth <INT>] [-imageHeight <INT>] <CONFIG_FILE>
+
+
+B<Example>
+
+identifyKmerSize sampleProject.cfg
+
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=item B<-outputCount>
+
+Turn on this will output the kmer count files. WARNING, this may require a lot of disk space.
+
+=item B<-imageWidth>
+
+The width of the output image (in pixel). Default 800.
+
+=item B<-imageHeight>
+
+The height of the output image (in pixel). Default 800.
+
+=back
+
+
+=head1 DESCRIPTION
+
+This script will streamline the process of generating a uniqueness plot.
+For more information, see L<http://www.appliedbioinformatics.com.au/index.php/DiffKAP>
+
+
+=head1 LICENSE
+
+Copyright (c) 2012 Chon-Kit Kenneth Chan. All rights reserved.
+
+This script is freely available for non-commercial use 
+and is covered by the GNU General Public License v3 or later. 
+See L<http://www.gnu.org/licenses/gpl.html>
+
+The user of the script agrees to acknowledge the author(s) in any 
+scientific publication of results based in part on the use of the script.
+
+=cut
+

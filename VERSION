@@ -1,0 +1,26 @@
+VERSION 0.9
+- Fixed numOfRead count problem for fastq in summary report
+- Added evalue in summary report
+- Reduced the # of system for file handling
+
+VERSION 0.80032
+- Added extra layer in the output folder based on IDs 
+
+VERSION 0.80031
+- Updated the help message
+
+VERSION 0.8003
+- identifyKmerSize will detect if the optimal kmer size exist, if yes, use it.
+
+VERSION 0.8002
+- Added the suggested kmer size file
+
+VERSION 0.8001
+- Fix a bug in generating summary file
+
+VERSION 0.8
+- Added an auto identify kmer size feature
+
+VERSION 0.701
+
+
