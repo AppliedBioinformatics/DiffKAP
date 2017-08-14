@@ -34,7 +34,7 @@ DiffKAP depends on the following things:
 	* a VERSION file
 	* an example data folder containing a small subset of a metatranscriptomic data
 - read the README
-- Install the DiffKAP setup script by typing: DiffKAP_setup
+- Install the DiffKAP setup script by running: DiffKAP_setup
 *** If you like, you can add the DiffKAP path to $PATH or just use an absolute path for running DiffKAP ***
 
 
@@ -65,25 +65,3 @@ DiffKAP depends on the following things:
 	4.A result summary file with 'summary.log' in the filename.
 
 
-===== Where to get help? ===== 
-Check the FAQ section in the DiffKAP web site: http://www.appliedbioinformatics.com.au/index.php/DiffKAP
-If FAQ section does not solve your problem, please email Kenneth Chan (c.chan10@uq.edu.au).
-
-
-===== What license is DiffKAP under? =====
-This script is covered by the GNU General Public License v3 or later. 
-You can redistribute it and/or modify it under the terms of the GNU 
-General Public License v3 or later as published by the Free Software 
-Foundation. 
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS.
-This program is distributed WITHOUT ANY WARRANTY; without even the 
-implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-
-The user of the script agrees to acknowledge the author(s) in any 
-scientific publication of results based in part on the use of the scripts.
-
-This copyright notice must be included in all distribution of the scripts.
-
-***** Copyright (c) 2012 Chon-Kit Kenneth Chan. All rights reserved. *****
